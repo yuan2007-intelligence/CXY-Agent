@@ -1,0 +1,6 @@
+# 运行产物
+reports/*.md
+!reports/.gitkeep
+__pycache__/
+*.pyc
+.DS_Store
