@@ -1,0 +1,487 @@
+"""新闻源采集：统一从 RSS / Google News / RSSHub 拉取，输出统一格式的 Article 列表。"""
+from __future__ import annotations
+
+import hashlib
+import logging
+import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from html import unescape
+from html.parser import HTMLParser
+from typing import Iterable
+from urllib.parse import parse_qsl, quote_plus, urlencode, urlparse, urlunparse
+
+import feedparser
+import httpx
+from dateutil import parser as date_parser
+from googlenewsdecoder import new_decoderv1
+
+log = logging.getLogger(__name__)
+
+USER_AGENT = "Mozilla/5.0 (compatible; CXYAgent/1.0)"
+MAX_HTTP_ATTEMPTS = 3
+
+
+def _url_for_dedup(url: str) -> str:
+    """规范化 URL，去掉追踪参数但保留可能承载文章 ID 的业务参数。"""
+    p = urlparse(url)
+    tracking = {
+        "fbclid", "gclid", "dclid", "msclkid", "mc_cid", "mc_eid",
+        "ref", "ref_", "source", "spm", "utm_source", "utm_medium",
+        "utm_campaign", "utm_content", "utm_term",
+    }
+    query = urlencode(sorted(
+        (key, value) for key, value in parse_qsl(p.query, keep_blank_values=True)
+        if key.lower() not in tracking and not key.lower().startswith("utm_")
+    ))
+    return urlunparse((p.scheme.lower(), p.netloc.lower(), p.path.rstrip("/"), "", query, ""))
+
+
+@dataclass
+class Article:
+    title: str
+    url: str
+    summary: str
+    source: str
+    published_at: datetime | None = None
+    # primary=官方机构/公司一手发布；trusted=可信媒体；discovery=聚合发现线索。
+    source_tier: str = "trusted"
+    # RSS 通常只带摘要；二阶段筛选时再填充正文，避免一开始对所有链接发请求。
+    content: str = ""
+    uid: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.uid = hashlib.sha1(_url_for_dedup(self.url).encode("utf-8")).hexdigest()[:16]
+
+
+def _parse_date(entry) -> datetime | None:
+    for key in ("published", "updated", "created"):
+        val = entry.get(key)
+        if not val:
+            continue
+        try:
+            dt = date_parser.parse(val)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def _clean_summary(raw: str, limit: int = 600) -> str:
+    if not raw:
+        return ""
+    text = re.sub(r"<[^>]+>", "", raw)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:limit]
+
+
+class _ArticleTextExtractor(HTMLParser):
+    """轻量提取页面正文，不引入依赖且避免把脚本/导航送进模型。"""
+
+    TEXT_TAGS = {"p", "li", "h1", "h2", "h3", "blockquote"}
+    SKIP_TAGS = {"script", "style", "noscript", "svg", "nav", "footer", "header"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._text_depth = 0
+        self._skip_depth = 0
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        tag = tag.lower()
+        if tag in self.SKIP_TAGS:
+            self._skip_depth += 1
+        if tag in self.TEXT_TAGS:
+            self._text_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag in self.TEXT_TAGS and self._text_depth:
+            self._text_depth -= 1
+        if tag in self.SKIP_TAGS and self._skip_depth:
+            self._skip_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if self._text_depth and not self._skip_depth:
+            text = re.sub(r"\s+", " ", unescape(data)).strip()
+            if text:
+                self.parts.append(text)
+
+
+def _extract_page_text(html: str, max_chars: int) -> str:
+    parser = _ArticleTextExtractor()
+    try:
+        parser.feed(html)
+        parser.close()
+    except Exception:
+        return ""
+    # 相邻标签偶有重复，保留首次出现，减少菜单/页脚带来的噪声。
+    unique = list(dict.fromkeys(parser.parts))
+    return "\n".join(unique)[:max_chars]
+
+
+def _fetch_article_text(article: Article, max_chars: int, attempts: int = 2) -> tuple[Article, bool]:
+    for attempt in range(1, attempts + 1):
+        try:
+            r = httpx.get(article.url, headers={"User-Agent": USER_AGENT}, timeout=15.0, follow_redirects=True)
+            r.raise_for_status()
+            content_type = r.headers.get("content-type", "")
+            if "html" not in content_type.lower():
+                return article, False
+            text = _extract_page_text(r.text, max_chars)
+            if len(text) < 200:
+                return article, False
+            article.content = text
+            return article, True
+        except httpx.HTTPStatusError as e:
+            # 4xx(付费墙/反爬/404)重试无意义；5xx/429 属于临时故障，值得再试一次。
+            status = e.response.status_code
+            if (status < 500 and status != 429) or attempt == attempts:
+                log.debug("fetch article body failed for %s: %s", article.url[:100], e)
+                return article, False
+        except (httpx.HTTPError, ValueError) as e:
+            if attempt == attempts:
+                log.debug("fetch article body failed for %s: %s", article.url[:100], e)
+                return article, False
+        time.sleep(1.0 * attempt)
+    return article, False
+
+
+def fetch_article_bodies(
+    articles: list[Article], max_workers: int = 8, max_chars: int = 6000,
+) -> list[Article]:
+    """并发补齐候选文章正文；失败时保留 RSS 摘要继续后续流程。"""
+    if not articles:
+        return articles
+    fetched = 0
+    with ThreadPoolExecutor(max_workers=max(1, max_workers)) as pool:
+        futures = [pool.submit(_fetch_article_text, a, max_chars) for a in articles]
+        for future in as_completed(futures):
+            _, ok = future.result()
+            fetched += int(ok)
+    log.info("article body fetch: %d / %d candidates have extracted text", fetched, len(articles))
+    return articles
+
+
+def _resolve_google_news_url(gnews_url: str) -> str:
+    """将 Google News 中转链接解析为原始文章 URL，失败时返回原链接。"""
+    if "news.google.com" not in gnews_url:
+        return gnews_url
+    try:
+        result = new_decoderv1(gnews_url, interval=0)
+        if result.get("status") and result.get("decoded_url"):
+            return result["decoded_url"]
+    except Exception as e:
+        log.debug("gnews decode failed for %s: %s", gnews_url[:80], e)
+    return gnews_url
+
+
+def _fetch_feed(url: str, source_name: str) -> list[Article]:
+    """拉一个 RSS feed,容错返回空列表。"""
+    parsed = None
+    for attempt in range(1, MAX_HTTP_ATTEMPTS + 1):
+        try:
+            response = httpx.get(url, headers={"User-Agent": USER_AGENT}, timeout=20.0, follow_redirects=True)
+            response.raise_for_status()
+            parsed = feedparser.parse(response.content)
+            break
+        except (httpx.HTTPError, ValueError) as e:
+            if attempt == MAX_HTTP_ATTEMPTS:
+                log.warning("fetch %s failed after %d attempts: %s", source_name, attempt, e)
+                return []
+            delay = 0.5 * (2 ** (attempt - 1))
+            log.info("fetch %s failed (attempt %d/%d), retrying in %.1fs", source_name, attempt, MAX_HTTP_ATTEMPTS, delay)
+            time.sleep(delay)
+
+    assert parsed is not None
+
+    if parsed.bozo and not parsed.entries:
+        log.warning("bad feed %s: %s", source_name, getattr(parsed, "bozo_exception", ""))
+        return []
+
+    out: list[Article] = []
+    for entry in parsed.entries:
+        url_ = entry.get("link")
+        title = entry.get("title")
+        if not url_ or not title:
+            continue
+        out.append(Article(
+            title=title.strip(),
+            url=url_.strip(),
+            summary=_clean_summary(entry.get("summary", "") or entry.get("description", "")),
+            source=source_name,
+            published_at=_parse_date(entry),
+        ))
+    return out
+
+
+def fetch_rss_sources(feeds: list[dict]) -> list[Article]:
+    """从配置的 RSS 源批量拉取。"""
+    all_articles: list[Article] = []
+    for feed in feeds:
+        name = feed["name"]
+        articles = _fetch_feed(feed["url"], name)
+        tier = feed.get("tier", "trusted")
+        for article in articles:
+            article.source_tier = tier
+        log.info("RSS [%s] -> %d articles", name, len(articles))
+        all_articles.extend(articles)
+        time.sleep(0.3)  # 礼貌延时
+    return all_articles
+
+
+# Google News 的检索区域决定了能搜到哪些语种的报道：在 zh-CN 区域里搜英文引号
+# 短语几乎总是 0 条。因此按查询词的文字自动选区域(汉字→中国、其他→英文区)。
+_GOOGLE_NEWS_LOCALES = (
+    (re.compile(r"[一-鿿]"), ("zh-CN", "CN", "CN:zh")),
+)
+_GOOGLE_NEWS_DEFAULT_LOCALE = ("en-US", "US", "US:en")
+# Google News 标题固定以 " - 媒体名" 结尾；不剥掉会干扰跨源标题去重。
+_GOOGLE_NEWS_PUBLISHER = re.compile(r"^(?P<title>.*\S)\s+-\s+(?P<publisher>[^-]{1,40})$")
+
+
+def _google_news_locale(query: str) -> tuple[str, str, str]:
+    for pattern, locale in _GOOGLE_NEWS_LOCALES:
+        if pattern.search(query):
+            return locale
+    return _GOOGLE_NEWS_DEFAULT_LOCALE
+
+
+def _split_google_news_title(title: str) -> tuple[str, str]:
+    """'标题 - 媒体' → ('标题', '媒体')；无后缀时媒体为空。"""
+    m = _GOOGLE_NEWS_PUBLISHER.match(title)
+    if not m:
+        return title, ""
+    return m.group("title"), m.group("publisher").strip()
+
+
+def fetch_google_news(queries: list[str], max_per_query: int | None = None) -> list[Article]:
+    """Google News RSS 搜索（免费、稳定、不需 key）。
+
+    URL 模板：https://news.google.com/rss/search?q=KEYWORD&hl=<区域>&gl=<国家>&ceid=<国家:语言>
+    when:7d 限制 7 天窗口（配合一周推送一次的节奏）；区域按查询词文字自动选择。
+    max_per_query 截断每个查询的结果(Google 已按相关度排序)，控制粗筛 token 成本。
+    """
+    all_articles: list[Article] = []
+    for query in queries:
+        encoded = quote_plus(f"{query} when:7d")
+        hl, gl, ceid = _google_news_locale(query)
+        url = f"https://news.google.com/rss/search?q={encoded}&hl={hl}&gl={gl}&ceid={ceid}"
+        articles = _fetch_feed(url, f"Google News: {query}")
+        total = len(articles)
+        if max_per_query:
+            articles = articles[:max_per_query]
+        for article in articles:
+            article.source_tier = "discovery"
+            title, publisher = _split_google_news_title(article.title)
+            if publisher:
+                article.title = title
+                article.source = publisher
+        log.info("Google News [%s] (%s) -> %d articles (kept %d)", query, hl, total, len(articles))
+        all_articles.extend(articles)
+        time.sleep(0.5)
+
+    # 并发解析所有 Google News 中转链接
+    gnews_articles = [a for a in all_articles if "news.google.com" in a.url]
+    if gnews_articles:
+        log.info("resolving %d Google News URLs (concurrent)...", len(gnews_articles))
+        resolved = 0
+        with ThreadPoolExecutor(max_workers=20) as pool:
+            future_to_article = {
+                pool.submit(_resolve_google_news_url, a.url): a
+                for a in gnews_articles
+            }
+            for future in as_completed(future_to_article):
+                article = future_to_article[future]
+                new_url = future.result()
+                if new_url != article.url:
+                    article.url = new_url
+                    article.uid = hashlib.sha1(_url_for_dedup(new_url).encode("utf-8")).hexdigest()[:16]
+                    resolved += 1
+        log.info("resolved %d / %d Google News URLs", resolved, len(gnews_articles))
+
+    return all_articles
+
+
+def fetch_rsshub(instance: str, routes: list[dict]) -> list[Article]:
+    """RSSHub 路由（用于 X / 微信公众号等需要二次包装的源）。"""
+    if not routes:
+        return []
+    all_articles: list[Article] = []
+    instance = instance.rstrip("/")
+    for route in routes:
+        url = f"{instance}{route['path']}"
+        articles = _fetch_feed(url, f"RSSHub: {route['name']}")
+        for article in articles:
+            article.source_tier = "discovery"
+        log.info("RSSHub [%s] -> %d articles", route["name"], len(articles))
+        all_articles.extend(articles)
+        time.sleep(0.5)
+    return all_articles
+
+
+def filter_by_age(
+    articles: Iterable[Article],
+    max_age_hours: int | None,
+    drop_undated: bool = False,
+) -> list[Article]:
+    """丢弃发布时间早于 max_age_hours 的文章。
+
+    默认保留无 published_at 的文章(避免误杀普通 RSS)。drop_undated=True 时连无日期的
+    一并丢弃。None 或 <=0 时不过滤。
+    """
+    if not max_age_hours or max_age_hours <= 0:
+        return list(articles)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+    kept: list[Article] = []
+    dropped_by_source: dict[str, int] = {}
+    for a in articles:
+        too_old = a.published_at is not None and a.published_at < cutoff
+        undated = a.published_at is None and drop_undated
+        if too_old or undated:
+            dropped_by_source[a.source] = dropped_by_source.get(a.source, 0) + 1
+            continue
+        kept.append(a)
+    for src, n in sorted(dropped_by_source.items(), key=lambda x: -x[1])[:5]:
+        log.info("filter_by_age: dropped %d stale articles from %s", n, src)
+    return kept
+
+
+def dedupe(articles: Iterable[Article]) -> list[Article]:
+    """按 uid 去重，保留第一条。"""
+    seen: set[str] = set()
+    out: list[Article] = []
+    for a in articles:
+        if a.uid in seen:
+            continue
+        seen.add(a.uid)
+        out.append(a)
+    return out
+
+
+def _normalize_title(title: str) -> str:
+    t = re.sub(r"[\s　]+", "", title)
+    return t.lower()
+
+
+def _extract_key_terms(raw_title: str) -> set[str]:
+    """从原始标题中提取关键术语（产品名+版本号、英文单词），用于跨语言去重。
+
+    在中英文字符边界处插入空格后提取带连字符/点号的完整标识符，
+    这样"GPT-4o" → {"gpt-4o"}, "COSMOPlat" → {"cosmoplat"}。
+    """
+    s = re.sub(r"([一-鿿])([a-zA-Z\d])", r"\1 \2", raw_title)
+    s = re.sub(r"([a-zA-Z\d])([一-鿿])", r"\1 \2", s)
+    s = s.lower()
+    return {t for t in re.findall(r"[a-z\d]+(?:[.\-][a-z\d]+)*", s) if len(t) >= 2}
+
+
+# 出现在大量标题里、不能指认具体事件的词。只共享这些词(如 "工业大模型")
+# 的两个标题不应被判成同一事件。
+_GENERIC_TERMS = {
+    "ai", "llm", "llms", "agi", "agent", "agents", "aigc", "app", "apps",
+    "the", "and", "for", "with", "new", "from", "how", "why", "what", "its",
+    "cn", "us", "uk", "data", "model", "models", "chip", "chips",
+    "robot", "robots", "robotics", "factory", "factories", "manufacturing",
+    "smart", "industry", "industrial", "cnc", "mes", "iiot", "5g",
+}
+
+
+def _is_specific_term(term: str) -> bool:
+    return term not in _GENERIC_TERMS and (len(term) >= 4 or any(c.isdigit() for c in term))
+
+
+def _is_similar(norm_a: str, norm_b: str, raw_a: str, raw_b: str, threshold: float) -> bool:
+    from difflib import SequenceMatcher
+
+    if SequenceMatcher(None, norm_a, norm_b).ratio() >= threshold:
+        return True
+
+    # 关键术语重叠（处理中英混排标题，如"卡奥斯发布新平台" vs "COSMOPlat launches platform"）
+    # 至少要共享一个具体术语(公司名/产品名/名单名)，避免 "工业大模型" 这类泛词把不同事件合并。
+    terms_a = _extract_key_terms(raw_a)
+    terms_b = _extract_key_terms(raw_b)
+    if len(terms_a) >= 2 and len(terms_b) >= 2:
+        overlap = terms_a & terms_b
+        smaller = min(len(terms_a), len(terms_b))
+        if len(overlap) / smaller >= 0.7 and any(_is_specific_term(t) for t in overlap):
+            return True
+
+    return False
+
+
+def _normalize_body(text: str) -> str:
+    """正文归一化：去 HTML 标签、去空白与标点、转小写，便于做字符指纹比较。"""
+    if not text:
+        return ""
+    t = re.sub(r"<[^>]+>", "", text)          # 去掉 RSS 摘要里常见的 HTML 标签
+    t = re.sub(r"[^\w一-鿿]+", "", t)          # 只保留字母数字下划线 + 中文
+    return t.lower()
+
+
+def _shingles(text: str, n: int = 4) -> set[str]:
+    """字符 n-gram 指纹。中英文通用，无需分词。"""
+    if len(text) < n:
+        return {text} if text else set()
+    return {text[i : i + n] for i in range(len(text) - n + 1)}
+
+
+def _body_similar(body_a: str, body_b: str, threshold: float) -> bool:
+    """正文相似度：字符 4-gram 的 Jaccard 重叠。用于标题不同但内容雷同的跨源重复。"""
+    na, nb = _normalize_body(body_a), _normalize_body(body_b)
+    # 正文太短（如官网首页/纯链接条目）不参与正文判重，避免误杀
+    if len(na) < 60 or len(nb) < 60:
+        return False
+    sa, sb = _shingles(na), _shingles(nb)
+    if not sa or not sb:
+        return False
+    inter = len(sa & sb)
+    union = len(sa | sb)
+    return union > 0 and inter / union >= threshold
+
+
+def dedupe_by_content(
+    articles: list[Article],
+    threshold: float = 0.65,
+    body_threshold: float = 0.85,
+) -> list[Article]:
+    """跨源去重：比标题和正文指纹；有正文时优先使用正文而不是 RSS 摘要。"""
+    if not articles:
+        return []
+
+    kept: list[Article] = []
+    normed: list[str] = []
+
+    for a in articles:
+        na = _normalize_title(a.title)
+        dup_idx: int | None = None
+        for i, nk in enumerate(normed):
+            if _is_similar(na, nk, a.title, kept[i].title, threshold) or _body_similar(
+                a.content or a.summary, kept[i].content or kept[i].summary, body_threshold
+            ):
+                dup_idx = i
+                break
+        if dup_idx is not None:
+            a_text = a.content or a.summary
+            kept_text = kept[dup_idx].content or kept[dup_idx].summary
+            tier_rank = {"primary": 3, "trusted": 2, "discovery": 1}
+            a_rank = (tier_rank.get(a.source_tier, 0), len(a_text))
+            kept_rank = (tier_rank.get(kept[dup_idx].source_tier, 0), len(kept_text))
+            if a_rank > kept_rank:
+                log.debug("content dedup: replace [%s] with [%s]", kept[dup_idx].title, a.title)
+                kept[dup_idx] = a
+                normed[dup_idx] = na
+            else:
+                log.debug("content dedup: drop [%s] (dup of [%s])", a.title, kept[dup_idx].title)
+        else:
+            kept.append(a)
+            normed.append(na)
+
+    dropped = len(articles) - len(kept)
+    if dropped:
+        log.info("dedupe_by_content: removed %d cross-source duplicates", dropped)
+    return kept

@@ -1,0 +1,82 @@
+name: Weekly CXY Push
+
+on:
+  schedule:
+    # 主梯队：北京时间周二/四/六 12:00 = UTC 同日 04:00。
+    # GitHub 整点 schedule 在高峰期可能延迟数小时甚至整个跳过，
+    # 故加 16:30（UTC 08:30）兜底梯队；兜底运行带 --skip-if-ran-today，
+    # 当日已有产物时静默跳过，保证一天只推一次。
+    # 运行时 TZ=Asia/Shanghai，main.py 按北京时间 weekday 选择板块。
+    - cron: '0 4 * * 2,4,6'
+    - cron: '30 8 * * 2,4,6'
+  workflow_dispatch:  # 允许手动触发(在 Actions 页面)
+    inputs:
+      test_push:
+        description: '只测试推送(不抓新闻)'
+        type: boolean
+        default: false
+      category:
+        description: '手动指定板块(忽略 weekday 排期)'
+        type: choice
+        options:
+          - ''
+          - industry
+          - research
+          - academia
+
+permissions:
+  contents: write  # 需要写权限,跑完要 commit state/ 回去
+
+concurrency:
+  group: weekly-cxy
+  cancel-in-progress: false
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      TZ: Asia/Shanghai
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run CXY agent
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          CATEGORY: ${{ github.event.inputs.category }}
+        run: |
+          if [[ -n "$CATEGORY" ]]; then
+            python -m cxy_agent.main --category "$CATEGORY"
+          elif [[ "${{ github.event.inputs.test_push }}" == "true" ]]; then
+            python -m cxy_agent.main --test-push
+          elif [[ "$GITHUB_EVENT_NAME" == "schedule" ]]; then
+            python -m cxy_agent.main --skip-if-ran-today
+          else
+            python -m cxy_agent.main
+          fi
+
+      - name: Commit updated state and output
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [[ -n "$(git status --porcelain state/ output/)" ]]; then
+            git add state/
+            [[ -d output ]] && git add output/
+            git commit -m "chore: cxy output $(date -u +%Y-%m-%d)"
+            git push
+          else
+            echo "no state/output change to commit"
+          fi
