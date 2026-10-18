@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 __pycache__/
 *.pyc
 .venv/
@@ -5,3 +6,11 @@ venv/
 .env
 .DS_Store
 *.log
+=======
+# 运行产物
+reports/*.md
+!reports/.gitkeep
+__pycache__/
+*.pyc
+.DS_Store
+>>>>>>> 32bdbe93199c86d165effec23e8e6d3dff9f7e4e
