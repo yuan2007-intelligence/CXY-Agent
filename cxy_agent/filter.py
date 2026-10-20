@@ -25,10 +25,12 @@ CATEGORY_FOCUS_LABELS = {
 }
 
 # keyword.md 三个章节标题里稳定的定位词（用户改章节副标题也不影响解析）。
+# 注意：keyword.md 由用户手工维护（AI 不得编辑），章节是 ### 层级的
+# 「第N部分：主题词」结构，定位词必须与用户文件保持一致。
 CATEGORY_HEADER_MARKERS = {
-    "industry": ("第一章", "产业与实践"),
-    "research": ("第二章", "技术与科研"),
-    "academia": ("第三章", "大学阶段学习"),
+    "industry": ("第一部分", "产业与实践"),
+    "research": ("第二部分", "科研与技术进展"),
+    "academia": ("第三部分", "大学阶段学习"),
 }
 # 对所有板块都适用的通用小节：拼在每个板块小节之后一起喂给模型。
 SHARED_SECTION_MARKERS = ("排除词", "采集偏好")
@@ -202,22 +204,37 @@ def _norm(s: str) -> str:
     return re.sub(r"\s+", "", s or "")
 
 
+def _split_keyword_sections(keywords_md: str) -> tuple[str, list[str]]:
+    """把 keyword.md 切成 (前言, 小节列表)。
+
+    章节可能在 ## 或 ### 层级（keyword.md 由用户手工维护，结构可能调整），
+    两种层级都兼容：先按 ## 切，含 ### 小节的块再二次切分，保证不论
+    章节是哪级标题，都能按小节标题做板块匹配。
+    """
+    top = re.split(r"(?=^## )", keywords_md, flags=re.M)
+    preamble = top[0]
+    sections: list[str] = []
+    for block in top[1:]:
+        sections.extend(re.split(r"(?=^### )", block, flags=re.M))
+    return preamble, sections
+
+
 def focus_keywords_md(keywords_md: str, category: str) -> str:
     """按当日板块从 keyword.md 中裁出对应章节 + 通用小节。
 
-    keyword.md 按「第一章/第二章/第三章」组织产/研/学三块关键词，另有
-    维护指南（编辑说明）、排除词与采集偏好（通用规则）、组合检索示例（人看的）。
+    keyword.md 按「第N部分」组织产/研/学三块关键词（### 层级，挂在
+    「产学研情报采集关键字」总标题下），另有 排除词 与 采集偏好 两个
+    通用小节拼在每个板块小节之后一起喂给模型；项目介绍等其余小节是
+    给人看的说明，不进模型上下文。
     只把当日章节与通用小节喂给模型，避免其余章节稀释注意力、浪费 token；
     解析不到匹配章节时原样返回全文兜底，绝不因为裁剪逻辑让模型收不到规则。
     """
-    sections = re.split(r"(?=^## )", keywords_md, flags=re.M)
-    if len(sections) <= 1:
-        return keywords_md
+    preamble, sections = _split_keyword_sections(keywords_md)
 
     markers = CATEGORY_HEADER_MARKERS.get(category, ())
     matched: list[str] = []
     shared: list[str] = []
-    for sec in sections[1:]:
+    for sec in sections:
         header = _norm(sec.splitlines()[0]) if sec.strip() else ""
         if any(m in header for m in markers):
             matched.append(sec)
@@ -227,7 +244,7 @@ def focus_keywords_md(keywords_md: str, category: str) -> str:
 
     if not matched:
         return keywords_md
-    return sections[0] + "".join(matched) + "".join(shared)
+    return preamble + "".join(matched) + "".join(shared)
 
 
 def _article_to_dict(

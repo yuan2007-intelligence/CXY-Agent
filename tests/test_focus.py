@@ -15,19 +15,19 @@ KEYWORDS = (ROOT / "keyword.md").read_text("utf-8")
 class TestFocus(unittest.TestCase):
     def test_each_category_matches_its_chapter(self):
         pairs = {
-            "industry": ("第一章", "排除词"),
-            "research": ("第二章", "排除词"),
-            "academia": ("第三章", "排除词"),
+            "industry": ("第一部分", "排除词"),
+            "research": ("第二部分", "排除词"),
+            "academia": ("第三部分", "排除词"),
         }
         for category, (chapter, shared) in pairs.items():
             focused = focus_keywords_md(KEYWORDS, category)
             self.assertIn(chapter, focused, category)
             # 通用小节(排除词)必须一起进入上下文
             self.assertIn(shared, focused, category)
-            # 其他章节不得进入
-            for other_chapter in ("第一章", "第二章", "第三章"):
+            # 其他章节不得进入（章节是 ### 层级，用三级标题断言避免误匹配）
+            for other_chapter in ("第一部分", "第二部分", "第三部分"):
                 if other_chapter != chapter:
-                    self.assertNotIn(f"## {other_chapter}", focused, category)
+                    self.assertNotIn(f"### {other_chapter}", focused, category)
 
     def test_editing_notes_are_excluded(self):
         focused = focus_keywords_md(KEYWORDS, "industry")
