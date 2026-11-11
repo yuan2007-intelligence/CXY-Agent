@@ -1,0 +1,10 @@
+{
+  "appid": "touristappid",
+  "projectname": "数智产学研",
+  "compileType": "miniprogram",
+  "miniprogramRoot": "./",
+  "setting": {
+    "es6": true,
+    "urlCheck": false
+  }
+}

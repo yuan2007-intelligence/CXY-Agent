@@ -87,6 +87,28 @@ def _parse_item(line: str) -> Optional[Keyword]:
 def parse_config(md_text: str) -> KeywordConfig:
     """把 keyword.md 全文解析为 KeywordConfig。"""
     cfg = KeywordConfig()
+    # 当前三板块格式；保留下面的旧版格式兼容。
+    if "第一部分：" in md_text:
+        target = None
+        for raw in _COMMENT_RE.sub("", md_text).splitlines():
+            line = raw.strip()
+            if line.startswith("### "):
+                target = (cfg.industry_events if "第一部分" in line else
+                          cfg.research if "第二部分" in line else
+                          cfg.academia if "第三部分" in line else
+                          cfg.exclusions if "排除词" in line else None)
+            if "信息时间范围" in line:
+                match = _DAYS_RE.search(line)
+                if match:
+                    cfg.days = max(1, int(match.group(1)))
+            kw = _parse_item(line)
+            if kw and target is not None:
+                if target is cfg.exclusions:
+                    target.extend(kw.terms)
+                else:
+                    target.append(kw)
+        return cfg
+
     section = None       # 当前二级标题
     subsection = None    # 当前三级标题
     in_exclusion = False

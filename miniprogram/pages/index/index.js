@@ -1,0 +1,8 @@
+Page({
+ data:{items:[],visible:[],category:'all',query:'',savedOnly:false,loading:true,error:'',updated:'',count:0,tabs:[{id:'all',name:'全部'},{id:'industry',name:'产 · 实践'},{id:'research',name:'研 · 前沿'},{id:'academia',name:'学 · 成长'}]},
+ onLoad(){this.load()},onShow(){this.filter()},onPullDownRefresh(){this.load()},
+ applyCatalog(c){getApp().globalData.catalog=c;this.setData({items:c.items,count:c.items.length,updated:c.updatedAt?c.updatedAt.slice(0,10):'',loading:false,error:''});this.filter()},
+ load(){if(!getApp().globalData.apiBase){this.applyCatalog(getApp().globalData.catalog);wx.stopPullDownRefresh();return}this.setData({loading:true,error:''});wx.request({url:getApp().globalData.apiBase+'/api/catalog',success:r=>{if(r.statusCode!==200||!Array.isArray(r.data.items)){this.setData({error:'内容服务暂不可用'});return}getApp().globalData.catalog=r.data;this.setData({items:r.data.items,count:r.data.items.length,updated:r.data.updatedAt?r.data.updatedAt.slice(0,10):''});this.filter()},fail:()=>this.setData({error:'连接失败，请检查后端服务及网络设置'}),complete:()=>{this.setData({loading:false});wx.stopPullDownRefresh()}})},
+ filter(){const saved=wx.getStorageSync('saved')||[];const q=this.data.query.toLowerCase();this.setData({visible:this.data.items.filter(i=>(this.data.category==='all'||i.category===this.data.category)&&(!this.data.savedOnly||saved.includes(i.id))&&(i.title+' '+i.summary).toLowerCase().includes(q))})},
+ tab(e){this.setData({category:e.currentTarget.dataset.id});this.filter()},search(e){this.setData({query:e.detail.value});this.filter()},saved(){this.setData({savedOnly:!this.data.savedOnly});this.filter()},open(e){wx.navigateTo({url:'/pages/detail/detail?id='+encodeURIComponent(e.currentTarget.dataset.id)})}
+})

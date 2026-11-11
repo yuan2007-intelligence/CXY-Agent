@@ -259,7 +259,7 @@ def _split_google_news_title(title: str) -> tuple[str, str]:
     return m.group("title"), m.group("publisher").strip()
 
 
-def fetch_google_news(queries: list[str], max_per_query: int | None = None) -> list[Article]:
+def fetch_google_news(queries: list[str], max_per_query: int | None = None, days: int = 7) -> list[Article]:
     """Google News RSS 搜索（免费、稳定、不需 key）。
 
     URL 模板：https://news.google.com/rss/search?q=KEYWORD&hl=<区域>&gl=<国家>&ceid=<国家:语言>
@@ -268,7 +268,7 @@ def fetch_google_news(queries: list[str], max_per_query: int | None = None) -> l
     """
     all_articles: list[Article] = []
     for query in queries:
-        encoded = quote_plus(f"{query} when:7d")
+        encoded = quote_plus(f"{query} when:{days}d")
         hl, gl, ceid = _google_news_locale(query)
         url = f"https://news.google.com/rss/search?q={encoded}&hl={hl}&gl={gl}&ceid={ceid}"
         articles = _fetch_feed(url, f"Google News: {query}")
