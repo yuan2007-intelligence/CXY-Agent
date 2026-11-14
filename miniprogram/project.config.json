@@ -1,10 +1,36 @@
 {
-  "appid": "touristappid",
+  "appid": "wxaa30606999f31847",
   "projectname": "数智产学研",
   "compileType": "miniprogram",
   "miniprogramRoot": "./",
   "setting": {
     "es6": true,
-    "urlCheck": false
-  }
+    "urlCheck": false,
+    "postcss": false,
+    "compileWorklet": false,
+    "minified": false,
+    "uglifyFileName": false,
+    "uploadWithSourceMap": true,
+    "enhance": false,
+    "packNpmManually": false,
+    "packNpmRelationList": [],
+    "minifyWXSS": true,
+    "minifyWXML": true,
+    "localPlugins": false,
+    "disableUseStrict": false,
+    "useCompilerPlugins": false,
+    "condition": false,
+    "babelSetting": {
+      "ignore": [],
+      "disablePlugins": [],
+      "outputPath": ""
+    }
+  },
+  "simulatorPluginLibVersion": {},
+  "packOptions": {
+    "ignore": [],
+    "include": []
+  },
+  "editorSetting": {},
+  "isGameTourist": false
 }
