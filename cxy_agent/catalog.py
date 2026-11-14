@@ -12,6 +12,13 @@ from . import filter as scoring
 
 ROOT = Path(__file__).resolve().parent.parent
 CATALOG = ROOT / 'data/catalog.json'
+# 本地后端配置；已有服务器环境变量优先，不执行文件中的任何代码。
+_env_file = ROOT / '.env'
+if _env_file.exists():
+    for _line in _env_file.read_text().splitlines():
+        _name, _sep, _value = _line.partition('=')
+        if _sep and _name.strip() == 'DEEPSEEK_API_KEY':
+            os.environ.setdefault('DEEPSEEK_API_KEY', _value.strip().strip('\"').strip("'"))
 LABELS = {'industry': '产 · 产业实践', 'research': '研 · 技术前沿', 'academia': '学 · 学习成长'}
 
 
@@ -21,11 +28,27 @@ def plan():
     return cfg, groups
 
 
-def collect(limit=None):
+def collect(limit=None, interests=None, persist=True):
     cfg, groups = plan()
+    if interests is not None:
+        from copy import copy
+        filtered = {}
+        for category, words in groups.items():
+            chosen = []
+            for word in words:
+                terms = [t.split('：', 1)[-1] for t in word.terms if t.split('：', 1)[-1] in interests]
+                if terms:
+                    item = copy(word)
+                    item.terms = terms
+                    chosen.append(item)
+            if chosen:
+                filtered[category] = chosen
+        groups = filtered
+        if not groups:
+            raise ValueError('请选择有效关键词')
     key = os.environ.get('DEEPSEEK_API_KEY')
     if not key:
-        raise SystemExit('请设置 DEEPSEEK_API_KEY；不会用演示内容替代真实情报')
+        raise RuntimeError('请设置 DEEPSEEK_API_KEY；不会用演示内容替代真实情报')
     client = openai.OpenAI(api_key=key, base_url='https://api.deepseek.com', timeout=90)
     keywords = (ROOT / 'keyword.md').read_text()
     cards = []
@@ -41,6 +64,8 @@ def collect(limit=None):
         raw = sources.dedupe_by_content(sources.dedupe(sources.filter_by_age(raw, cfg.days*24, drop_undated=True)))
         raw = [a for a in raw if not any(t.lower() in (a.title+' '+a.summary).lower() for t in cfg.exclusions)]
         focused = scoring.focus_keywords_md(keywords, category)
+        if interests is not None:
+            focused = '用户本次关注关键词：' + '、'.join(t for k in selected for t in k.terms) + '\n仅保留与这些关键词相关的内容。\n' + focused
         coarse = scoring.score_articles(client, raw, focused, 'deepseek-chat', active_category=category)
         if any(s.reason in ('评分失败', '解析失败', '结果格式错误') for s in coarse):
             raise RuntimeError('粗筛失败，保留上次内容，请重试')
@@ -64,6 +89,8 @@ def collect(limit=None):
                           'references': [{'title': r.title, 'url': r.url} for r in s.related_articles]})
     result = {'updatedAt': datetime.now(timezone.utc).astimezone().isoformat(), 'days': cfg.days, 'stats': stats,
               'keywords': {c: [{'label': k.label, 'priority': k.priority} for k in ks] for c, ks in groups.items()}, 'items': cards}
+    if not persist:
+        return result
     CATALOG.parent.mkdir(exist_ok=True)
     temp = CATALOG.with_suffix('.tmp')
     temp.write_text(json.dumps(result, ensure_ascii=False, indent=2))
