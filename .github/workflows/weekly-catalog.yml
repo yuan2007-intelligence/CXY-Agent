@@ -1,0 +1,56 @@
+name: Weekly mini program catalog
+on:
+  schedule:
+    # 北京时间周一06:00 = UTC周日22:00
+    - cron: '0 22 * * 0'
+  workflow_dispatch:
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+concurrency:
+  group: weekly-catalog
+  cancel-in-progress: false
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Collect weekly information
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          python scripts/sync_interests.py
+          python -m cxy_agent.catalog --weekly
+      - name: Save catalog
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add data/catalog.json miniprogram/data/catalog.js miniprogram/data/interests.js
+          if ! git diff --cached --quiet; then
+            git commit -m 'chore: update weekly mini program catalog'
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi
+      - run: |
+          mkdir -p public
+          cp data/catalog.json public/catalog.json
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+  deploy:
+    needs: collect
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy weekly catalog
+        id: deployment
+        uses: actions/deploy-pages@v4

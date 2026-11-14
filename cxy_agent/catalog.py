@@ -28,8 +28,10 @@ def plan():
     return cfg, groups
 
 
-def collect(limit=None, interests=None, persist=True):
+def collect(limit=None, interests=None, persist=True, days=None, weekly=False):
     cfg, groups = plan()
+    if days is not None:
+        cfg.days = days
     if interests is not None:
         from copy import copy
         filtered = {}
@@ -69,15 +71,23 @@ def collect(limit=None, interests=None, persist=True):
         coarse = scoring.score_articles(client, raw, focused, 'deepseek-chat', active_category=category)
         if any(s.reason in ('评分失败', '解析失败', '结果格式错误') for s in coarse):
             raise RuntimeError('粗筛失败，保留上次内容，请重试')
-        candidates = sorted([s for s in coarse if s.score >= 4 and category in s.categories], key=lambda s: -s.score)[:40]
+        candidates = sorted([s for s in coarse if s.score >= 4 and category in s.categories], key=lambda s: -s.score)
+        if not weekly:
+            candidates = candidates[:40]
         sources.fetch_article_bodies([s.article for s in candidates], max_workers=8, max_chars=6000)
-        assessed = scoring.assess_research_value(client, candidates, focused, 'deepseek-chat', category)
-        if any(s.reason in ('终评失败', '终评缺失') for s in assessed):
+        for attempt in range(3):
+            assessed = scoring.assess_research_value(client, candidates, focused, 'deepseek-chat', category)
+            if not any(s.reason in ('终评失败', '终评缺失') for s in assessed):
+                break
+            logging.warning('终评返回异常，重试 %s/3', attempt + 1)
+        else:
             raise RuntimeError('终评失败，保留上次内容，请重试')
         # keyword.md 指定：相关性30%、新颖性30%、可实践性40%。证据仍单独展示。
         for s in assessed:
             s.score = round(s.relevance*.3+s.innovation*.3+s.actionability*.4, 2)
-        top = scoring.group_by_event([s for s in assessed if s.score >= 6])[:20]
+        top = scoring.group_by_event([s for s in assessed if s.score >= 6])
+        if not weekly:
+            top = top[:20]
         top = scoring.summarize_top(client, top, focused, 'deepseek-chat')
         stats[category] = {'fetched': len(raw), 'selected': len(top)}
         for s in top:
@@ -86,6 +96,7 @@ def collect(limit=None, interests=None, persist=True):
                           'summary': s.summary or a.summary, 'source': a.source, 'url': a.url,
                           'date': a.published_at.isoformat()[:10] if a.published_at else '', 'score': s.score,
                           'evidence': s.evidence, 'priority': max((k.priority for k in words if any(t.lower() in (a.title+' '+a.summary).lower() for t in k.terms)), default=1),
+                          'matchedKeywords': list(dict.fromkeys(t.split('：', 1)[-1] for k in words for t in k.terms if t.split('：', 1)[-1].lower() in (a.title+' '+a.summary+' '+a.content).lower())),
                           'references': [{'title': r.title, 'url': r.url} for r in s.related_articles]})
     result = {'updatedAt': datetime.now(timezone.utc).astimezone().isoformat(), 'days': cfg.days, 'stats': stats,
               'keywords': {c: [{'label': k.label, 'priority': k.priority} for k in ks] for c, ks in groups.items()}, 'items': cards}
@@ -103,6 +114,7 @@ def collect(limit=None, interests=None, persist=True):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
+    parser.add_argument('--weekly', action='store_true', help='采集近7天周汇总')
     parser.add_argument('--plan', action='store_true')
     parser.add_argument('--limit', type=int, help='每类最多检索多少条关键词；默认全部')
     args = parser.parse_args()
@@ -112,4 +124,4 @@ if __name__ == '__main__':
     else:
         if args.limit is not None and args.limit < 1:
             parser.error('--limit 必须大于0')
-        collect(args.limit)
+        collect(args.limit, days=7 if args.weekly else None, weekly=args.weekly)
